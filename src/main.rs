@@ -10,7 +10,7 @@ use dotenv::dotenv;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::RequestBuilder;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{cmp::Reverse, collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::{watch, Notify};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -208,7 +208,7 @@ async fn fetch_and_update(client: &MinecraftRestCacheAPIClient, status_tx: &watc
 
         let mut new_player_history: Vec<StatusPlayerHistory> =
             new_player_history_map.into_values().collect();
-        new_player_history.sort_by_key(|player| player.last_online);
+        new_player_history.sort_by_key(|player| Reverse(player.last_online));
         let new_status = Status {
             motd: motd.to_string(),
             max_players: max_players,
