@@ -10,8 +10,10 @@ use dotenv::dotenv;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::RequestBuilder;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{cmp::Reverse, collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
-use tokio::sync::{watch, Notify};
+use tokio::sync::{mpsc, watch, Notify};
+use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Status {
@@ -59,6 +61,11 @@ struct AppState {
     client_connected: Arc<Notify>,
 }
 
+enum PlayersNotification {
+    Joined(ServerStatusPlayer),
+    Left(ServerStatusPlayer),
+}
+
 // `#[tokio::main]` transforms `async fn main()` into a synchronous main function
 // that initializes the Tokio multi-threaded async runtime and drives the top-level future.
 #[tokio::main]
@@ -70,10 +77,24 @@ async fn main() {
     // Consumers don't get flooded with missed historical messages—they only care about the freshest state.
     let (status_tx, status_rx) = watch::channel(Status::default());
     let client_connected = Arc::new(Notify::new());
+    let (player_event_tx, player_event_rx) = mpsc::channel(16);
+
+    let upstream_host = std::env::var("MINECRAFT_SERVER_MANAGEMENT_API_HOST")
+        .expect("Expected MINECRAFT_SERVER_MANAGEMENT_API_HOST");
+    let notifications_url = notification_websocket_url(&upstream_host)
+        .expect("Invalid MINECRAFT_SERVER_MANAGEMENT_API_HOST");
 
     // `tokio::spawn` submits a lightweight async task (green thread) to the Tokio runtime.
     // It runs concurrently with the rest of `main` without blocking the main execution path.
-    tokio::spawn(upstream_poller_task(status_tx, client_connected.clone()));
+    tokio::spawn(upstream_poller_task(
+        status_tx,
+        client_connected.clone(),
+        player_event_rx,
+    ));
+    tokio::spawn(player_notification_listener(
+        notifications_url,
+        player_event_tx,
+    ));
 
     let state = AppState {
         status_rx,
@@ -108,7 +129,11 @@ impl MinecraftRestCacheAPIClient {
 }
 
 // Background poller running endlessly in its spawned Tokio task.
-async fn upstream_poller_task(status_tx: watch::Sender<Status>, notify: Arc<Notify>) {
+async fn upstream_poller_task(
+    status_tx: watch::Sender<Status>,
+    notify: Arc<Notify>,
+    mut player_events: mpsc::Receiver<PlayersNotification>,
+) {
     // `reqwest::Client` uses an `Arc` internally, so standard HTTP connection pooling
     // is preserved across loop iterations without needing `&mut self`.
     let http_client = reqwest::Client::new();
@@ -128,22 +153,119 @@ async fn upstream_poller_task(status_tx: watch::Sender<Status>, notify: Arc<Noti
         if status_tx.receiver_count() <= 1 {
             println!("No active clients connected. Poller going to sleep...");
 
-            notify.notified().await;
-
-            println!("Client connected, waking back up!");
-            fetch_and_update(&client, &status_tx).await;
-            interval.reset();
+            tokio::select! {
+                _ = notify.notified() => {
+                    println!("Client connected, waking back up!");
+                    fetch_and_update(&client, &status_tx, None).await;
+                    interval.reset();
+                }
+                event = player_events.recv() => {
+                    if event.is_some() {
+                        println!("Player event received while poller was sleeping.");
+                        fetch_and_update(&client, &status_tx, event).await;
+                        interval.reset();
+                    }
+                }
+            }
+            continue;
         }
 
-        // `.tick().await` waits until the next interval elapsed without blocking OS threads.
-        interval.tick().await;
-        if status_tx.receiver_count() > 1 {
-            fetch_and_update(&client, &status_tx).await;
+        tokio::select! {
+            // `.tick().await` waits until the next interval elapsed without blocking OS threads.
+            _ = interval.tick() => {
+                println!("There are {} clients connected. Polling upstream for status...", status_tx.receiver_count());
+                fetch_and_update(&client, &status_tx, None).await;
+            }
+            event = player_events.recv() => {
+                if event.is_some() {
+                    println!("Player event received; refreshing cached status.");
+                    fetch_and_update(&client, &status_tx, event).await;
+                    interval.reset();
+                }
+            }
+            _ = notify.notified() => {
+                if status_tx.receiver_count() > 1 {
+                    println!("Client connected, waking back up!");
+                    fetch_and_update(&client, &status_tx, None).await;
+                    interval.reset();
+                }
+            }
         }
     }
 }
 
-async fn fetch_and_update(client: &MinecraftRestCacheAPIClient, status_tx: &watch::Sender<Status>) {
+fn notification_websocket_url(upstream_host: &str) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(upstream_host).map_err(|err| err.to_string())?;
+    let websocket_scheme = match url.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        "ws" => "ws",
+        "wss" => "wss",
+        scheme => return Err(format!("Unsupported upstream URL scheme: {scheme}")),
+    };
+    url.set_scheme(websocket_scheme)
+        .map_err(|_| "Could not convert upstream URL to a websocket URL".to_string())?;
+    url.set_path(&format!(
+        "{}/notifications",
+        url.path().trim_end_matches('/')
+    ));
+    url.set_query(None);
+    url.set_fragment(None);
+
+    Ok(url.to_string())
+}
+
+async fn player_notification_listener(
+    notifications_url: String,
+    player_events: mpsc::Sender<PlayersNotification>,
+) {
+    loop {
+        match connect_async(&notifications_url).await {
+            Ok((mut socket, _)) => {
+                println!("Connected to player notification websocket.");
+                while let Some(message) = socket.next().await {
+                    match message {
+                        Ok(ClientMessage::Text(text)) => {
+                            println!("Received player notification: {}", text);
+                            match parse_player_notification(&text) {
+                                Some(notification) => {
+                                    if player_events.send(notification).await.is_err() {
+                                        eprintln!("Failed to send player notification to channel.");
+                                        break;
+                                    }
+                                }
+                                None => {
+                                    eprintln!(
+                                        "Received unrecognized player notification: {}",
+                                        text
+                                    );
+                                }
+                            }
+                        }
+                        Ok(ClientMessage::Close(_)) => {
+                            eprintln!("Player notification websocket closed.");
+                            break;
+                        }
+                        Err(err) => {
+                            eprintln!("Player notification websocket failed: {err}");
+                            break;
+                        }
+                        Ok(_) => {}
+                    }
+                }
+            }
+            Err(err) => eprintln!("Could not connect to player notifications: {err}"),
+        }
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+async fn fetch_and_update(
+    client: &MinecraftRestCacheAPIClient,
+    status_tx: &watch::Sender<Status>,
+    recent_event: Option<PlayersNotification>,
+) {
     // Create Future primitives for each HTTP request without `.await`ing them immediately.
     let motd_req = client.get("/motd").send();
     let server_status_req = client.get("/server").send();
@@ -183,6 +305,25 @@ async fn fetch_and_update(client: &MinecraftRestCacheAPIClient, status_tx: &watc
         let is_allowlist_enforced = is_allowlist_enforced_res.json().await.unwrap_or(false);
         let allowlist: Vec<ServerStatusPlayer> = allowlist_res.json().await.unwrap_or(Vec::new());
 
+        let current_players = server_status.players.unwrap_or(Vec::new());
+        // Convert current players list to a HashMap for efficient lookup and update
+        let mut current_players_map: HashMap<String, ServerStatusPlayer> = current_players
+            .iter()
+            .map(|player| (player.id.clone(), player.clone()))
+            .collect();
+
+        match recent_event {
+            Some(PlayersNotification::Joined(player)) => {
+                // If a player joined, add them to the current players map
+                current_players_map.insert(player.id.clone(), player);
+            }
+            Some(PlayersNotification::Left(player)) => {
+                // If a player left, remove them from the current players map
+                current_players_map.remove(&player.id);
+            }
+            None => {}
+        }
+
         // TODO: This could be done better
         let existing_player_history = status_tx.borrow().players_history.clone();
         let mut new_player_history_map: HashMap<String, StatusPlayerHistory> = HashMap::new();
@@ -191,8 +332,7 @@ async fn fetch_and_update(client: &MinecraftRestCacheAPIClient, status_tx: &watc
             new_player_history_map.insert(existing_player.id.clone(), existing_player);
         }
         // Overwrite with current player data
-        let current_players = server_status.players.unwrap_or(Vec::new());
-        for current_player in &current_players {
+        for current_player in current_players_map.values() {
             new_player_history_map.insert(
                 current_player.id.clone(),
                 StatusPlayerHistory {
@@ -213,15 +353,11 @@ async fn fetch_and_update(client: &MinecraftRestCacheAPIClient, status_tx: &watc
             motd: motd.to_string(),
             max_players: max_players,
             online: server_status.started,
-            players_online: current_players,
+            players_online: current_players_map.values().cloned().collect(),
             players_history: new_player_history,
             is_allowlist_enforced: is_allowlist_enforced,
             allowlist: allowlist,
             version: server_status.version.name,
-            // last_updated: std::time::SystemTime::now()
-            //     .duration_since(std::time::UNIX_EPOCH)
-            //     .unwrap_or_default()
-            //     .as_secs(),
         };
 
         // `status_tx.send(...)` notifies all active `status_rx` receivers.
@@ -289,4 +425,39 @@ async fn handle_socket(socket: WebSocket, mut status_rx: watch::Receiver<Status>
         _ = (&mut recv_task) => send_task.abort(),
         _ = (&mut send_task) => recv_task.abort(),
     };
+}
+
+fn parse_player_notification(message: &str) -> Option<PlayersNotification> {
+    let notification: Value = serde_json::from_str(message).unwrap_or_default();
+    let method = notification.get("method").and_then(Value::as_str)?;
+    let params = notification.get("params").and_then(Value::as_array)?;
+    let player_info = params.get(0)?;
+    let player: ServerStatusPlayer =
+        serde_json::from_value(player_info.clone()).unwrap_or(ServerStatusPlayer {
+            id: "".to_string(),
+            name: "".to_string(),
+        });
+
+    match method {
+        "minecraft:notification/players/joined" => Some(PlayersNotification::Joined(player)),
+        "minecraft:notification/players/left" => Some(PlayersNotification::Left(player)),
+        _ => None, // Default case, should not happen
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::notification_websocket_url;
+
+    #[test]
+    fn builds_notifications_url_from_http_api_host() {
+        assert_eq!(
+            notification_websocket_url("http://localhost:3000").unwrap(),
+            "ws://localhost:3000/notifications"
+        );
+        assert_eq!(
+            notification_websocket_url("https://example.com/api/").unwrap(),
+            "wss://example.com/api/notifications"
+        );
+    }
 }
